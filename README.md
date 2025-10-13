@@ -2,7 +2,7 @@
 
 **Mamba in Rust** provides a from-scratch implementation of the **Mamba State Space Model (SSM)** architecture, powered by the [**Burn**](https://github.com/burn-rs/burn) deep learning framework.  
 
-Mamba is a *selective SSM* designed as an efficient alternative to Transformers — achieving **linear-time scaling** with sequence length while maintaining competitive performance on language modeling, time-series forecasting, and beyond.  
+Mamba is a *selective SSM* designed as an efficient alternative to Transformers achieving **linear-time scaling** with sequence length while maintaining competitive performance on language modeling, time-series forecasting, and beyond.  
 
 By leveraging **Rust’s performance and safety**, this project aims for **fast inference**, **efficient training**, and **seamless deployment**, including **WebAssembly (WASM)** support for browser-based machine learning.
 
