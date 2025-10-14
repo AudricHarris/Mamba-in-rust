@@ -1,3 +1,5 @@
+# English
+
 # 🐍 Mamba in Rust
 
 **Mamba in Rust** provides a from-scratch implementation of the **Mamba State Space Model (SSM)** architecture, powered by the [**Burn**](https://github.com/burn-rs/burn) deep learning framework.  
@@ -39,3 +41,42 @@ By leveraging **Rust’s performance and safety**, this project aims for **fast 
 git clone https://github.com/AudricHarris/mamba-in-rust.git
 cd mamba-in-rust
 cargo build --release
+```
+
+# French
+
+# 🐍 Mamba en Rust
+
+Mamba en Rust propose une implémentation from-scratch de l'architecture Mamba State Space Model (SSM), alimentée par le framework d'apprentissage profond [**Burn**](https://github.com/burn-rs/burn).
+
+Mamba est un SSM sélectif conçu comme une alternative efficace aux Transformers, atteignant un échelle linéaire en fonction de la longueur de la séquence tout en maintenant des performances compétitives en modélisation de langage, prévision de séries temporelles, et plus encore.
+
+En tirant parti de la performance et de la sécurité de Rust, ce projet vise une inférence rapide, un entraînement efficace, et un déploiement fluide, incluant un support pour WebAssembly (WASM) pour l'apprentissage automatique basé sur navigateur.
+
+## 🧠 Pourquoi ce projet ?
+- ⚡ Efficacité : Mamba évite la complexité quadratique des Transformers, ce qui le rend idéal pour les tâches à contexte long ou en streaming.
+- 🦀 Avantages de Rust : Les abstractions sans coût zéro permettent une exécution à haute vitesse sans collecte de garbage. La sécurité mémoire de Rust élimine les bugs courants en ML.
+- 🔥 Intégration Burn : Accélération unifiée CPU/GPU, couches modulaires, et compatibilité avec l'écosystème pour des expérimentations rapides.
+
+
+> Note : Il s'agit d'un prototype en cours de développement, reconstruit à partir d'une version PyTorch antérieure (août–sept. 2024). Attendez-vous à des améliorations continues basées sur de nouvelles recherches et des tests pratiques. Des poids pré-entraînés et des notebooks de démonstration seront publiés sur Kaggle sous peu.
+
+## ✨ Fonctionnalités
+
+- Modules principaux : Couches SSM sélectives, noyaux récurrents adaptés au matériel, et primitives de modélisation de séquences.
+- Pipeline d'entraînement : Scripts pour le benchmarking sur des données synthétiques, des tâches de langage simplifiées, et des ensembles de données réels.
+- Portabilité : Compilation vers WebAssembly pour les appareils edge ou les démos en navigateur.
+- Extensibilité : Basculer facilement vers d'autres backends (ex. : CUDA, Metal) grâce à l'abstraction backend de Burn.
+
+## 🚀 Démarrage rapide
+
+### Prérequis
+- Rust 1.75+ (installez via [rustup](https://rustup.rs))
+- Framework d'apprentissage profond Burn (ajouté comme dépendance Cargo)
+
+### Installation
+```bash
+git clone https://github.com/AudricHarris/mamba-in-rust.git
+cd mamba-in-rust
+cargo build --release
+```
