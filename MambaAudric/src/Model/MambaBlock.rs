@@ -24,3 +24,26 @@ pub struct MambaBlock<B: Backend> {
     dParam   : Tensor<B, 1>,
     outProj  : Linear<B>,
 }
+
+impl MambaBlock
+{
+    pub fn init<B:Backend>(&self, &B::Device) -> MambaBlock<B>
+    {
+        
+    }
+
+    pub fn forward(&self, input : Tensor) -> Tensor
+    {
+        
+    }
+
+    pub fn ssm(&self, input : Tensor ) -> Tensor
+    {
+
+    }
+
+    pub fn SelectiveScan(&self, u, delta, A: Tensor<B, 1>, B: Tensor<B, 1>, C: Tensor<B, 1>, D: Tensor<B, 1>) -> Tensor<B, 1>
+    {
+
+    }
+}
