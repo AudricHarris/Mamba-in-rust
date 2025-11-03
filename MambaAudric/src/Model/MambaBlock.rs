@@ -1,7 +1,7 @@
 // Program     : MambaBlock.rs
 // Developper  : Audric HARRIS
 // Create Date : 21/10/2025
-// Update Date :  3/10/2025
+// Update Date :  3/11/2025
 // Objectif    : Create a versatile mamba block struct and config struct
 
 // I will be respecting my University writing convention.
