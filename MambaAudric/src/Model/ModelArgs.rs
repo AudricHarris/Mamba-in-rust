@@ -13,34 +13,57 @@ use burn::{
 
 // I made default values for the struct
 // In it's current state it would have  136_106_065 params
-#[derive(Config)]
+#[derive(Config, Debug, Clone)]
 pub struct ModelArgs
 {
-    dModel           : i32 = 1024,
-    dState           : i32 = 64,
-    FactorProjection : i32 = 2,
-    dConv            : i32 = 4,
-    nLayer           : i32 = 10,
-    vocabSize        : i32 = 50257, // GPT Trained vocabSize
+    dModel          : usize,
+    dState          : usize,
+    factorProjection: usize,
+    dConv           : usize,
+    nLayer          : usize,
+    vocabSize       : usize,
 
-    deltaTMin        : f64 = 0.05,
-    deltaTMax        : f64 = 0.2,
-    deltaTScale      : f64 = 0.05,
-    deltaTInitFloor  : f64 = 1e-4,
-    dropoutRate      : f64 = 0.01,
+    deltaTMin       : f64,
+    deltaTMax       : f64,
+    deltaTScale     : f64,
+    deltaTInitFloor : f64,
+    dropoutRate     : f64,
 
-    convBias  : bool = true,
-    bias      : bool = false,
-    useLmHead : bool = true,
+    convBias        : bool,
+    bias            : bool,
+    useLmHead       : bool,
+}
 
-    loss      : CrossEntropyLoss,
-    optimizer : AdamW,
+impl Default for ModelArgs
+{
+    fn default() -> Self
+    {
+        return Self {
+            dModel          : 1024,
+            dState          : 64,
+            factorProjection: 2,
+            dConv           : 4,
+            nLayer          : 10,
+            vocabSize       : 50257,
+
+            deltaTMin       : 0.05,
+            deltaTMax       : 0.2,
+            deltaTScale     : 0.05,
+            deltaTInitFloor : 1e-4,
+            dropoutRate     : 0.01,
+
+            convBias        : true,
+            bias            : false,
+            useLmHead       : true,
+        };
+    }
 }
 
 impl ModelArgs
 {
-    pub fn init<B: Backend>(&self, &B::Device) -> ModelArgs
+    pub fn init<B: Backend>(&self, device: &B::Device) -> Self
     {
-        struct test = ModelArgs
+        return Self::default();
     }
 }
+
