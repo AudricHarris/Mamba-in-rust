@@ -1,3 +1,10 @@
+// Program     : ModelArgs.rs
+// Developper  : Audric HARRIS
+// Create Date : 21/10/2025
+// Update Date :  3/11/2025
+// Objectif    : Main script to handle model size and hyper params
+
+
 use burn::{
     config::Config,
     module::Module,
