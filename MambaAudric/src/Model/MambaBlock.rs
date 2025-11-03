@@ -24,7 +24,20 @@ pub struct MambaBlockConfig
     dim   : usize,
     dInner: usize,
     dState: usize,
-    dConv : usize = 4,
+    dConv : usize,
+}
+
+impl Default for MambaBlockConfig
+{
+    fn default() -> Self
+    {
+        return Self { 
+            dim    : 1024,
+            dInner : 512,
+            dState : 64,
+            dConv  : 4,
+        };
+    }
 }
 
 #[derive(Module, Debug)]
@@ -45,7 +58,7 @@ impl MambaBlockConfig
     {
         let dtRank = (self.dim as f64 / 16.0).ceil() as usize;
 
-        let inProj = LinearConfig::new(self.dim, 2 * self.d_inner).with_bias(false).init(device);
+        let inProj = LinearConfig::new(self.dim, 2 * self.dInner).with_bias(false).init(device);
 
         let conv1d = Conv1dConfig::new(
             self.dInner,
