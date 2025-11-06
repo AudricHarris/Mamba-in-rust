@@ -9,93 +9,77 @@ use burn::{
     config::Config,
     module::Module,
     nn::{
-        norm::{rms_norm::{RMSNorm, RMSNormConfig}, Norm},
-        linear::LinearConfig,
+        norm::rms_norm::{RMSNorm, RMSNormConfig},
     },
     tensor::{backend::Backend, Tensor},
 };
-use crate::{ModelArgs, MambaBlock, MambaBlockConfig};
+use crate::{MambaBlock, MambaBlockConfig, ModelArgs};
 
 #[derive(Config)]
-pub struct ResidualBlockConfig
-{
-    d_model : usize,
-    d_state : usize,
-    d_conv  : usize,
-    d_inner_factor : usize,
-    eps : f64,
+pub struct ResidualBlockConfig {
+    d_model: usize,
+    d_state: usize,
+    d_conv: usize,
+    d_inner_factor: usize,
+    eps: f64,
 }
 
-impl Default for ResidualBlockConfig
-{
-    fn default() -> Self
-    {
-        return Self {
-            dModel = 1024,
-            dState = 64,
-            dConv  = 4,
-            dInnerFactor = 2,
-            eps = 1e-6,
-        };
+impl Default for ResidualBlockConfig {
+    fn default() -> Self {
+        Self {
+            d_model: 1024,
+            d_state: 64,
+            d_conv: 4,
+            d_inner_factor: 2,
+            eps: 1e-6,
+        }
     }
 }
 
 #[derive(Module, Debug)]
-pub struct ResidualBlock<B: Backend>
-{
+pub struct ResidualBlock<B: Backend> {
     mixer: MambaBlock<B>,
-    norm : RMSNorm<B>,
+    norm: RMSNorm<B>,
 }
 
-impl ResidualBlockConfig
-{
-    pub fn init<B: Backend>(&self, device: &B::Device) -> ResidualBlock<B>
-    {
-        let dInner = self.dModel * self.dInnerFactor;
-        let mambaConfig = MambaBlockConfig {
-            dim: self.dModel,
-            dInner,
-            dState: self.dState,
-            dConv: self.dConv,
+impl ResidualBlockConfig {
+    pub fn init<B: Backend>(&self, device: &B::Device) -> ResidualBlock<B> {
+        let d_inner = self.d_model * self.d_inner_factor;
+        let mamba_config = MambaBlockConfig {
+            dim: self.d_model,
+            d_inner,
+            d_state: self.d_state,
+            d_conv: self.d_conv,
         };
-
-        let mixer = mambaConfig.init(device);
-        let norm = RMSNormConfig::new(self.dModel).with_eps(self.eps).init(device);
-
-        return ResidualBlock { mixer, norm };
+        let mixer = mamba_config.init(device);
+        let norm = RMSNormConfig::new(self.d_model)
+            .with_eps(self.eps)
+            .init(device);
+        ResidualBlock { mixer, norm }
     }
 
-    pub fn fromModelArgs(args: &ModelArgs, device: &B::Device) -> ResidualBlock<B>
-    where
-        B: Backend,
-    {
+    pub fn from_model_args<B: Backend>(args: &ModelArgs, device: &B::Device) -> ResidualBlock<B> {
         let config = Self {
-            dModel: args.dModel,
-            dState: args.dState,
-            dConv: args.donv,
+            d_model: args.d_model,
+            d_state: args.d_state,
+            d_conv: args.d_conv,
             ..Default::default()
         };
-
-        return config.init(device);
+        config.init(device)
     }
 }
 
-impl<B: Backend> ResidualBlock<B>
-{
-    pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3>
-    {
-        let residual   = x.clone();
+impl<B: Backend> ResidualBlock<B> {
+    pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
+        let residual = x.clone();
         let normalized = self.norm.forward(x);
-        let mixed      = self.mixer.forward(normalized);
-
-        return mixed + residual;
+        let mixed = self.mixer.forward(normalized);
+        mixed + residual
     }
 }
 
-impl ModelArgs
-{
-    pub fn buildResidualBlock<B: Backend>(&self, device: &B::Device) -> ResidualBlock<B>
-    {
-        return ResidualBlockConfig::fromModelArgs(self, device);
+impl ModelArgs {
+    pub fn build_residual_block<B: Backend>(&self, device: &B::Device) -> ResidualBlock<B> {
+        ResidualBlockConfig::from_model_args(self, device)
     }
 }

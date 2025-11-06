@@ -5,72 +5,37 @@
 // Objectif    : Main script to handle model size and hyper params
 
 
-use burn::{
-    config::Config,
-    module::Module,
-    nn::{
-        conv::{Conv1d, Conv1dConfig},
-        linear::{Linear, LinearConfig},
-        loss::{CrossEntropyLoss, CrossEntropyLossConfig},
-    },
-    tensor::{Data, Element, Shape, Tensor, backend::Backend},
-    optim::AdamW,
-};
+use burn::config::Config;
 
-
-// I made default values for the struct
-// In it's current state it would have  136_106_065 params
 #[derive(Config, Debug, Clone)]
-pub struct ModelArgs
-{
-    dModel          : usize,
-    dState          : usize,
-    factorProjection: usize,
-    dConv           : usize,
-    nLayer          : usize,
-    vocabSize       : usize,
-
-    deltaTMin       : f64,
-    deltaTMax       : f64,
-    deltaTScale     : f64,
-    deltaTInitFloor : f64,
-    dropoutRate     : f64,
-
-    convBias        : bool,
-    bias            : bool,
-    useLmHead       : bool,
+pub struct ModelArgs {
+    d_model: usize,
+    d_state: usize,
+    d_inner_factor: usize,
+    d_conv: usize,
+    n_layer: usize,
+    vocab_size: usize,
+    dt_rank: Option<usize>,
+    dropout_rate: f64,
+    conv_bias: bool,
+    bias: bool,
+    use_lm_head: bool,
 }
 
-impl Default for ModelArgs
-{
-    fn default() -> Self
-    {
-        return Self {
-            dModel          : 1024,
-            dState          : 64,
-            factorProjection: 2,
-            dConv           : 4,
-            nLayer          : 10,
-            vocabSize       : 50257,
-
-            deltaTMin       : 0.05,
-            deltaTMax       : 0.2,
-            deltaTScale     : 0.05,
-            deltaTInitFloor : 1e-4,
-            dropoutRate     : 0.01,
-
-            convBias        : true,
-            bias            : false,
-            useLmHead       : true,
-        };
+impl Default for ModelArgs {
+    fn default() -> Self {
+        Self {
+            d_model: 1024,
+            d_state: 64,
+            d_inner_factor: 2,
+            d_conv: 4,
+            n_layer: 10,
+            vocab_size: 50257,
+            dt_rank: None,
+            dropout_rate: 0.01,
+            conv_bias: true,
+            bias: false,
+            use_lm_head: true,
+        }
     }
 }
-
-impl ModelArgs
-{
-    pub fn init<B: Backend>(&self, device: &B::Device) -> Self
-    {
-        return Self::default();
-    }
-}
-
