@@ -1,0 +1,240 @@
+// ============================================================
+// Program: MambaNLP.rs
+// Developer: Audric HARRIS
+// Create Date: 5/11/2025
+// Update Date: 5/11/2025
+// Objective: Implements the full Mamba language model for sentence generation and prediction,
+// including embedding, stacked residual blocks, final norm, tied LM head, forward with optional loss,
+// and a generation method with sampling options.
+// ============================================================
+
+use burn::{
+    config::Config,
+    module::{Module, ModuleHolder},
+    nn::{
+        embedding::EmbeddingConfig,
+        linear::{Linear, LinearConfig},
+        loss::CrossEntropyLossConfig,
+        norm::rms_norm::{RMSNorm, RMSNormConfig},
+    },
+    tensor::{
+        backend::Backend,
+        ops::{self, IntTensor},
+        Element, Shape, Tensor,
+    },
+};
+use crate::{ModelArgs, ResidualBlock, ResidualBlockConfig};
+
+// ------------------------------------------------------------
+// Structures
+// ------------------------------------------------------------
+
+#[derive(Config)]
+pub struct MambaNlpConfig {
+    vocab_size: usize,
+    n_layer: usize,
+    d_model: usize,
+    d_state: usize,
+    d_conv: usize,
+    d_inner_factor: usize,
+    dt_rank: Option<usize>,
+    dropout: f64,
+    bias: bool,
+    conv_bias: bool,
+    rms_eps: f64,
+    loss_config: CrossEntropyLossConfig,
+}
+
+impl Default for MambaNlpConfig {
+    fn default() -> Self {
+        Self {
+            vocab_size: 50_257,
+            n_layer: 10,
+            d_model: 1024,
+            d_state: 64,
+            d_conv: 4,
+            d_inner_factor: 2,
+            dt_rank: None,
+            dropout: 0.01,
+            bias: false,
+            conv_bias: true,
+            rms_eps: 1e-5,
+            loss_config: CrossEntropyLossConfig::new().with_ignore_index(-100i32),
+        }
+    }
+}
+
+impl MambaNlpConfig {
+    pub fn from_model_args(args: &ModelArgs) -> Self {
+        let d_inner = args.d_model * args.d_inner_factor;
+        let dt_rank = args.dt_rank.unwrap_or_else(|| ((d_inner as f64 / 16.0).ceil() as usize));
+        Self {
+            vocab_size: args.vocab_size,
+            n_layer: args.n_layer,
+            d_model: args.d_model,
+            d_state: args.d_state,
+            d_conv: args.d_conv,
+            d_inner_factor: args.d_inner_factor,
+            dt_rank: Some(dt_rank),
+            dropout: args.dropout_rate,
+            bias: args.bias,
+            conv_bias: args.conv_bias,
+            rms_eps: 1e-5,
+            ..Default::default()
+        }
+    }
+}
+
+#[derive(Module, Debug)]
+pub struct MambaNlp<B: Backend> {
+    embedding: burn::nn::embedding::Embedding<B>,
+    layers: ModuleHolder<Vec<ResidualBlock<B>>>,
+    norm_f: RMSNorm<B>,
+    lm_head: Linear<B>,
+    loss_config: CrossEntropyLossConfig,
+}
+
+impl MambaNlpConfig {
+    pub fn init<B: Backend>(&self, device: &B::Device) -> MambaNlp<B> {
+        let embedding = EmbeddingConfig::new(self.vocab_size, self.d_model).init(device);
+        let mut layers = Vec::with_capacity(self.n_layer);
+        for _ in 0..self.n_layer {
+            let res_config = ResidualBlockConfig {
+                d_model: self.d_model,
+                d_state: self.d_state,
+                d_conv: self.d_conv,
+                d_inner_factor: self.d_inner_factor,
+                eps: self.rms_eps,
+            };
+            layers.push(res_config.init(device));
+        }
+        let layers = ModuleHolder::new(layers);
+        let norm_f = RMSNormConfig::new(self.d_model)
+            .with_eps(self.rms_eps)
+            .init(device);
+        let lm_head = LinearConfig::new(self.d_model, self.vocab_size)
+            .with_bias(false)
+            .init(device);
+        let mut model = MambaNlp {
+            embedding,
+            layers,
+            norm_f,
+            lm_head,
+            loss_config: self.loss_config.clone(),
+        };
+        model.lm_head.weight = model.embedding.weight.clone();
+        model
+    }
+
+    pub fn from_model_args<B: Backend>(args: &ModelArgs, device: &B::Device) -> MambaNlp<B> {
+        let config = Self::from_model_args(args);
+        config.init(device)
+    }
+}
+
+impl<B: Backend> MambaNlp<B> {
+    pub fn forward(
+        &self,
+        input_ids: IntTensor<B, 2>,
+        targets: Option<IntTensor<B, 2>>,
+    ) -> (Tensor<B, 3>, Option<Tensor<B, 0>>) {
+        let (batch, seq_len) = input_ids.shape().dims;
+        let mut x = self.embedding.forward(input_ids);
+        for layer in self.layers.iter() {
+            x = layer.forward(x);
+        }
+        x = self.norm_f.forward(x);
+        let logits = self.lm_head.forward(x);
+        let loss = if let Some(tgts) = targets {
+            let flat_logits = logits.clone().view([batch * seq_len, self.lm_head.out_dim]);
+            let flat_tgts = tgts.flatten(0, 1);
+            let loss_fn = self.loss_config.init();
+            let ce_loss = loss_fn.forward(flat_logits, flat_tgts);
+            Some(ce_loss)
+        } else {
+            None
+        };
+        (logits, loss)
+    }
+
+    pub fn generate(
+        &self,
+        mut input_ids: IntTensor<B, 2>,
+        max_new_tokens: usize,
+        temperature: f64,
+        top_k: Option<usize>,
+        top_p: Option<f64>,
+        device: &B::Device,
+    ) -> IntTensor<B, 2> {
+        let batch = input_ids.shape().dims[0];
+        let mut generated = input_ids.clone();
+        for _ in 0..max_new_tokens {
+            let seq_len = generated.shape().dims[1];
+            let input_slice = generated.slice([.., seq_len - 1..seq_len]);
+            let (logits, _) = self.forward(input_slice, None);
+            let logits_last = logits.select(1, 0);
+            let scaled_logits = logits_last.clone().div_scalar(temperature as f32);
+            let next_token = if let (Some(k), Some(p)) = (top_k, top_p) {
+                self.sample_top_k_top_p(&scaled_logits, k, p, device)
+            } else if let Some(k) = top_k {
+                self.sample_top_k(&scaled_logits, k, device)
+            } else if let Some(p) = top_p {
+                self.sample_top_p(&scaled_logits, p, device)
+            } else {
+                scaled_logits.argmax(1).unsqueeze(1)
+            };
+            generated = IntTensor::cat(vec![generated, next_token], 1);
+        }
+        generated
+    }
+
+    fn sample_top_k(
+        &self,
+        logits: &Tensor<B, 2>,
+        k: usize,
+        device: &B::Device,
+    ) -> IntTensor<B, 2> {
+        let (vals, indices) = logits.topk(k, -1);
+        let mut masked_logits = Tensor::full_like(logits, f32::MIN);
+        masked_logits = masked_logits.scatter(-1, &indices.unsqueeze(-1), &vals);
+        let probs = masked_logits.softmax(-1);
+        probs.multinomial(1, true).int()
+    }
+
+    fn sample_top_p(
+        &self,
+        logits: &Tensor<B, 2>,
+        p: f64,
+        device: &B::Device,
+    ) -> IntTensor<B, 2> {
+        let (sorted_logits, sort_indices) = logits.clone().sort_descending(-1, true);
+        let sorted_probs = sorted_logits.softmax(-1);
+        let cum_probs = sorted_probs.cumsum(-1);
+        let mask = cum_probs.gt_scalar(p as f32);
+        let mut indices_to_remove = mask.clone();
+        let unsorted_mask = indices_to_remove.scatter(-1, &sort_indices, &indices_to_remove);
+        let probs = logits.softmax(-1).masked_fill(&unsorted_mask, 0.0);
+        let renormal = probs.clone().sum_dim(1).unsqueeze(1).recip();
+        let probs = probs.mul(&renormal);
+        probs.multinomial(1, true).int()
+    }
+
+    fn sample_top_k_top_p(
+        &self,
+        logits: &Tensor<B, 2>,
+        k: usize,
+        p: f64,
+        device: &B::Device,
+    ) -> IntTensor<B, 2> {
+        let (vals, indices) = logits.topk(k, -1);
+        let mut masked_logits = Tensor::full_like(logits, f32::MIN);
+        masked_logits = masked_logits.scatter(-1, &indices.unsqueeze(-1), &vals);
+        self.sample_top_p(&masked_logits, p, device)
+    }
+}
+
+impl ModelArgs {
+    pub fn build_mamba_nlp<B: Backend>(&self, device: &B::Device) -> MambaNlp<B> {
+        MambaNlpConfig::from_model_args(self, device)
+    }
+}
