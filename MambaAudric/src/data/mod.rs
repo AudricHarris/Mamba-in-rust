@@ -6,16 +6,16 @@
 // Objective: Stream Hugging Face text dataset into SQLite buffer
 // ============================================================
 
-use std::io::{BufRead, BufReader};
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::Path;
 
-use burn::tensor::{backend::Backend, Tensor};
-use burn_dataset::{SqliteDataset, Dataset};
-use serde::{Deserialize, Serialize};
-use serde_json::*;
+use burn::tensor::{Tensor, backend::Backend};
+use burn_dataset::{Dataset, SqliteDataset};
 use reqwest::blocking::Client;
 use rusqlite::{Connection, params};
+use serde::{Deserialize, Serialize};
+use serde_json::*;
 
 // ------------------------------------------------------------
 // Data Structures
@@ -40,9 +40,11 @@ pub struct DataBatch<B: Backend> {
 // ------------------------------------------------------------
 
 impl DataBatcher {
-    /// Stream a dataset from a Hugging Face JSONL URL into a local SQLite buffer.
-    /// This avoids downloading the entire dataset at once.
-    pub fn stream_to_sqlite(url: &str, db_path: &str, max_samples: Option<usize>) -> anyhow::Result<()> {
+    pub fn stream_to_sqlite(
+        url: &str,
+        db_path: &str,
+        max_samples: Option<usize>,
+    ) -> anyhow::Result<()> {
         println!("Starting stream from: {}", url);
 
         if let Some(parent) = Path::new(db_path).parent() {
@@ -51,7 +53,7 @@ impl DataBatcher {
 
         let conn = Connection::open(db_path)?;
         conn.execute(
-            "CREATE TABLE IF NOT EXISTS dataset (id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT)",
+            "CREATE TABLE IF NOT EXISTS dataset (row_id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT)",
             [],
         )?;
 
@@ -89,12 +91,11 @@ impl DataBatcher {
     }
 
     /// Convenience: print a random sample from the dataset.
-    pub fn print_sample(dataset: &SqliteDataset<TextItem>) {
-        if let Some(sample) = dataset.iter().next() {
-            println!("{:#?}", sample);
-        } else {
-            println!("No samples found in dataset.");
+    pub fn print_samples(dataset: &SqliteDataset<TextItem>, count: usize) {
+        println!("Printing first {count} samples:");
+
+        for (i, sample) in dataset.iter().take(count).enumerate() {
+            println!("{:4}: {:?}", i + 1, sample);
         }
     }
 }
-
