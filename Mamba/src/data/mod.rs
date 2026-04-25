@@ -2,7 +2,7 @@
 // File: data.rs
 // Developer: Audric HARRIS
 // Create Date: 6/11/2025
-// Update Date: 13/11/2025
+// Update Date: 25/04/2026
 // Objective: Stream Hugging Face text dataset into SQLite buffer
 // ============================================================
 
@@ -15,11 +15,10 @@ use burn_dataset::{Dataset, SqliteDataset};
 use reqwest::blocking::Client;
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
-use serde_json::*;
 
-// ------------------------------------------------------------
-// Data Structures
-// ------------------------------------------------------------
+// --------------- //
+// Data Structures //
+// --------------- //
 
 #[derive(Deserialize, Serialize, Clone, Debug)]
 pub struct TextItem {
@@ -35,9 +34,9 @@ pub struct DataBatch<B: Backend> {
     pub targets: Tensor<B, 2>,
 }
 
-// ------------------------------------------------------------
-// Streaming and Buffering Logic
-// ------------------------------------------------------------
+// ----------------------------- //
+// Streaming and Buffering Logic //
+// ----------------------------- //
 
 impl DataBatcher {
     pub fn stream_to_sqlite(
@@ -84,13 +83,11 @@ impl DataBatcher {
         Ok(())
     }
 
-    /// Load the buffered dataset from SQLite.
     pub fn load_buffered_dataset(db_path: &str) -> anyhow::Result<SqliteDataset<TextItem>> {
         let dataset = SqliteDataset::<TextItem>::from_db_file(db_path, "dataset")?;
         Ok(dataset)
     }
 
-    /// Convenience: print a random sample from the dataset.
     pub fn print_samples(dataset: &SqliteDataset<TextItem>, count: usize) {
         println!("Printing first {count} samples:");
 
