@@ -41,30 +41,19 @@ pub fn load_model(
     Ok(model)
 }
 
-pub fn train(
+/// Core training loop. Accepts an optional pre-loaded model so it can be
+/// used for both fresh training and fine-tuning from a checkpoint.
+fn run_training_loop(
+    mut model: MambaNlp<TrainBackend>,
     texts: &[String],
     tokenizer: &Tokenizer,
-    args: &ModelArgs,
     epochs: usize,
     seq_len: usize,
     batch_size: usize,
     max_tokens: Option<usize>,
     learning_rate: f64,
+    device: &WgpuDevice,
 ) -> MambaNlp<TrainBackend> {
-    let device = WgpuDevice::default();
-
-    let mut model: MambaNlp<TrainBackend> = if Path::new(&format!("{SAVE_PATH}.mpk.gz")).exists() {
-        match load_model(args, SAVE_PATH, &device) {
-            Ok(m) => { println!("Resumed from checkpoint."); m }
-            Err(e) => {
-                println!("Checkpoint load failed ({e}), starting fresh.");
-                MambaNlpConfig::from_args(args).init(&device)
-            }
-        }
-    } else {
-        MambaNlpConfig::from_args(args).init(&device)
-    };
-
     let mut optim = AdamConfig::new()
         .with_epsilon(1e-7)
         .init::<TrainBackend, MambaNlp<TrainBackend>>();
@@ -108,10 +97,10 @@ pub fn train(
 
             let real_batch = input_data.len() / seq_len;
             let input = Tensor::<TrainBackend, 2, Int>::from_data(
-                TensorData::new(input_data, [real_batch, seq_len]), &device,
+                TensorData::new(input_data, [real_batch, seq_len]), device,
             );
             let targets = Tensor::<TrainBackend, 2, Int>::from_data(
-                TensorData::new(target_data, [real_batch, seq_len]), &device,
+                TensorData::new(target_data, [real_batch, seq_len]), device,
             );
 
             let (_logits, loss_opt) = model.forward(input, Some(targets));
@@ -162,4 +151,66 @@ pub fn train(
     }
 
     model
+}
+
+/// Train a fresh model (or resume from the default checkpoint if one exists).
+pub fn train(
+    texts: &[String],
+    tokenizer: &Tokenizer,
+    args: &ModelArgs,
+    epochs: usize,
+    seq_len: usize,
+    batch_size: usize,
+    max_tokens: Option<usize>,
+    learning_rate: f64,
+) -> MambaNlp<TrainBackend> {
+    let device = WgpuDevice::default();
+
+    let model: MambaNlp<TrainBackend> =
+        if Path::new(&format!("{SAVE_PATH}.mpk.gz")).exists() {
+            match load_model(args, SAVE_PATH, &device) {
+                Ok(m) => { println!("Resumed from checkpoint."); m }
+                Err(e) => {
+                    println!("Checkpoint load failed ({e}), starting fresh.");
+                    MambaNlpConfig::from_args(args).init(&device)
+                }
+            }
+        } else {
+            MambaNlpConfig::from_args(args).init(&device)
+        };
+
+    run_training_loop(
+        model, texts, tokenizer,
+        epochs, seq_len, batch_size, max_tokens, learning_rate,
+        &device,
+    )
+}
+
+/// Load an existing checkpoint and continue training it (fine-tune / expand).
+///
+/// The model architecture must match `args`.  Use a lower learning rate
+/// (e.g. 1e-5) to avoid destroying previously learned weights.
+pub fn train_from_checkpoint(
+    checkpoint_path: &str,
+    texts: &[String],
+    tokenizer: &Tokenizer,
+    args: &ModelArgs,
+    epochs: usize,
+    seq_len: usize,
+    batch_size: usize,
+    max_tokens: Option<usize>,
+    learning_rate: f64,
+) -> anyhow::Result<MambaNlp<TrainBackend>> {
+    let device = WgpuDevice::default();
+
+    println!("Loading base model from: {checkpoint_path}");
+    let model = load_model(args, checkpoint_path, &device)?;
+    println!("Base model loaded. Starting fine-tuning…");
+
+    let trained = run_training_loop(
+        model, texts, tokenizer,
+        epochs, seq_len, batch_size, max_tokens, learning_rate,
+        &device,
+    );
+    Ok(trained)
 }
