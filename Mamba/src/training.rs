@@ -1,21 +1,81 @@
+// ============================================================
+// File: training.rs
+// Developer: Audric HARRIS
+// Update Date: 27/04/2026
+// ============================================================
+
 use burn::{
     backend::{Autodiff, wgpu::{Wgpu, WgpuDevice}},
     module::Module,
-    optim::{AdamConfig, GradientsParams, Optimizer},
+    optim::AdamConfig,
     record::{CompactRecorder, Recorder},
-    tensor::{Int, Tensor, TensorData},
+    tensor::backend::AutodiffBackend,
+    train::{
+        LearnerBuilder,
+        metric::LossMetric,
+        RegressionOutput,
+        TrainOutput,
+        TrainStep,
+        ValidStep,
+    },
 };
-use std::io::Write;
+use burn_dataset::InMemDataset;
 use std::path::Path;
+use burn::data::dataloader::DataLoaderBuilder;
 
-use crate::model::MambaNlp;
-use crate::model::ModelArgs;
-use crate::model::MambaNlpConfig;
+use crate::data::{MambaBatch, MambaBatcher, TextItem};
+use crate::model::{MambaNlp, ModelArgs, MambaNlpConfig};
 use crate::tokenizer::Tokenizer;
 
 pub type TrainBackend = Autodiff<Wgpu>;
+pub type InferBackend = Wgpu;
 
-pub const SAVE_PATH: &str = "checkpoints/mamba_model";
+pub const SAVE_PATH:    &str = "checkpoints/mamba_model";
+pub const ARTIFACT_DIR: &str = "artifacts";
+
+
+impl<B: AutodiffBackend> TrainStep<MambaBatch<B>, RegressionOutput<B>>
+    for MambaNlp<B>
+{
+    fn step(&self, batch: MambaBatch<B>) -> TrainOutput<RegressionOutput<B>> {
+        let [batch_size, seq_len] = batch.inputs.dims();
+        let (logits, loss) = self.forward(batch.inputs, Some(batch.targets.clone()));
+        let loss = loss.expect("targets provided → loss must be Some");
+
+        let vocab   = logits.dims()[2];
+        let n       = batch_size * seq_len;
+        let output  = logits.reshape([n, vocab]);
+        let targets = batch.targets
+            .reshape([n])
+            .float()
+            .unsqueeze_dim::<2>(1);
+
+        let regression_out = RegressionOutput::new(loss.clone(), output, targets);
+        TrainOutput::new(self, loss.backward(), regression_out)
+    }
+}
+
+impl<B: burn::tensor::backend::Backend>
+    ValidStep<MambaBatch<B>, RegressionOutput<B>>
+    for MambaNlp<B>
+{
+    fn step(&self, batch: MambaBatch<B>) -> RegressionOutput<B> {
+        let [batch_size, seq_len] = batch.inputs.dims();
+        let (logits, loss) = self.forward(batch.inputs, Some(batch.targets.clone()));
+        let loss = loss.expect("targets provided → loss must be Some");
+
+        let vocab   = logits.dims()[2];
+        let n       = batch_size * seq_len;
+        let output  = logits.reshape([n, vocab]);
+        let targets = batch.targets
+            .reshape([n])
+            .float()
+            .unsqueeze_dim::<2>(1);
+
+        RegressionOutput::new(loss, output, targets)
+    }
+}
+
 
 pub fn save_model(model: &MambaNlp<TrainBackend>, path: &str) -> anyhow::Result<()> {
     if let Some(parent) = Path::new(path).parent() {
@@ -29,8 +89,8 @@ pub fn save_model(model: &MambaNlp<TrainBackend>, path: &str) -> anyhow::Result<
 }
 
 pub fn load_model(
-    args: &ModelArgs,
-    path: &str,
+    args:   &ModelArgs,
+    path:   &str,
     device: &WgpuDevice,
 ) -> anyhow::Result<MambaNlp<TrainBackend>> {
     let record = CompactRecorder::new()
@@ -41,135 +101,67 @@ pub fn load_model(
     Ok(model)
 }
 
-/// Core training loop. Accepts an optional pre-loaded model so it can be
-/// used for both fresh training and fine-tuning from a checkpoint.
-fn run_training_loop(
-    mut model: MambaNlp<TrainBackend>,
-    texts: &[String],
-    tokenizer: &Tokenizer,
-    epochs: usize,
-    seq_len: usize,
-    batch_size: usize,
-    max_tokens: Option<usize>,
+
+pub fn run_training_loop(
+    model:         MambaNlp<TrainBackend>,
+    train_dataset: InMemDataset<TextItem>,
+    valid_dataset: InMemDataset<TextItem>,
+    tokenizer:     Tokenizer,
+    epochs:        usize,
+    seq_len:       usize,
+    batch_size:    usize,
     learning_rate: f64,
-    device: &WgpuDevice,
-) -> MambaNlp<TrainBackend> {
-    let mut optim = AdamConfig::new()
-        .with_epsilon(1e-7)
-        .init::<TrainBackend, MambaNlp<TrainBackend>>();
+    device:        &WgpuDevice,
+) -> anyhow::Result<MambaNlp<TrainBackend>> {
+    let batcher_train = MambaBatcher::<TrainBackend>::new(tokenizer.clone(), device.clone(), seq_len);
+    let batcher_valid = MambaBatcher::<InferBackend>::new(tokenizer,         device.clone(), seq_len);
 
-    let mut all_tokens: Vec<usize> = Vec::new();
-    for text in texts {
-        let mut enc = tokenizer.encode(text);
-        enc.push(2);
-        all_tokens.extend(enc);
-    }
-    if let Some(limit) = max_tokens {
-        all_tokens.truncate(limit);
-    }
+    let dataloader_train = DataLoaderBuilder::new(batcher_train)
+        .batch_size(batch_size)
+        .num_workers(4)
+        .shuffle(42)
+        .build(train_dataset);
 
-    let chunks: Vec<&[usize]> = all_tokens
-        .windows(seq_len + 1)
-        .step_by(seq_len)
-        .collect();
-    let total_steps_per_epoch = (chunks.len() as f32 / batch_size as f32).ceil() as usize;
+    let dataloader_valid = DataLoaderBuilder::new(batcher_valid)
+        .batch_size(batch_size)
+        .num_workers(2)
+        .build(valid_dataset);
 
-    println!(
-        "Training on {} tokens | Vocab: {} | Batches/epoch: {} | LR: {:.2e}",
-        all_tokens.len(), tokenizer.vocab_size, total_steps_per_epoch, learning_rate
-    );
+    let learner = LearnerBuilder::new(ARTIFACT_DIR)
+        .metric_train_numeric(LossMetric::new())
+        .metric_valid_numeric(LossMetric::new())
+        .with_file_checkpointer(CompactRecorder::new())
+        .devices(vec![device.clone()])
+        .num_epochs(epochs)
+        .summary()
+        .build(
+            model,
+            AdamConfig::new().init(),
+            learning_rate,
+        );
 
-    for epoch in 0..epochs {
-        let mut total_loss = 0f32;
-        let mut steps_ok   = 0usize;
-        let mut steps_nan  = 0usize;
-
-        for (batch_idx, batch_chunks) in chunks.chunks(batch_size).enumerate() {
-            let mut input_data:  Vec<i32> = Vec::new();
-            let mut target_data: Vec<i32> = Vec::new();
-
-            for chunk in batch_chunks {
-                if chunk.len() < seq_len + 1 { continue; }
-                for &t in &chunk[..seq_len]    { input_data.push(t as i32); }
-                for &t in &chunk[1..=seq_len]  { target_data.push(t as i32); }
-            }
-            if input_data.is_empty() { continue; }
-
-            let real_batch = input_data.len() / seq_len;
-            let input = Tensor::<TrainBackend, 2, Int>::from_data(
-                TensorData::new(input_data, [real_batch, seq_len]), device,
-            );
-            let targets = Tensor::<TrainBackend, 2, Int>::from_data(
-                TensorData::new(target_data, [real_batch, seq_len]), device,
-            );
-
-            let (_logits, loss_opt) = model.forward(input, Some(targets));
-            let loss = loss_opt.expect("loss should be Some when targets provided");
-            let loss_val: f32 = loss.clone().into_scalar();
-
-            if batch_idx % 10 == 0 || batch_idx + 1 == total_steps_per_epoch {
-                let pct = (batch_idx as f32 / total_steps_per_epoch as f32) * 100.0;
-                print!(
-                    "\rEpoch [{}/{}] Step [{}/{}] ({:.1}%) Loss: {:.4}  NaN steps: {}",
-                    epoch + 1, epochs, batch_idx + 1, total_steps_per_epoch,
-                    pct, loss_val, steps_nan
-                );
-                let _ = std::io::stdout().flush();
-            }
-
-            if loss_val.is_nan() || loss_val.is_infinite() {
-                steps_nan += 1;
-                continue;
-            }
-
-            total_loss += loss_val;
-            steps_ok   += 1;
-
-            let grads = loss.backward();
-            let grads = GradientsParams::from_grads(grads, &model);
-            model = optim.step(learning_rate, model, grads);
-        }
-
-        println!();
-        if steps_ok > 0 {
-            let avg = total_loss / steps_ok as f32;
-            println!(
-                "Epoch {} done. Avg loss: {:.4}  ({} ok, {} NaN)",
-                epoch + 1, avg, steps_ok, steps_nan
-            );
-        } else {
-            println!(
-                "Epoch {} — ALL {} steps returned NaN. \
-                 Check model init / learning rate.",
-                epoch + 1, steps_nan
-            );
-        }
-
-        if let Err(e) = save_model(&model, SAVE_PATH) {
-            eprintln!("Warning: checkpoint save failed: {e}");
-        }
-    }
-
-    model
+    let trained = learner.fit(dataloader_train, dataloader_valid);
+    save_model(&trained, SAVE_PATH)?;
+    Ok(trained)
 }
 
-/// Train a fresh model (or resume from the default checkpoint if one exists).
+
 pub fn train(
-    texts: &[String],
-    tokenizer: &Tokenizer,
-    args: &ModelArgs,
-    epochs: usize,
-    seq_len: usize,
-    batch_size: usize,
-    max_tokens: Option<usize>,
+    train_dataset: InMemDataset<TextItem>,
+    valid_dataset: InMemDataset<TextItem>,
+    tokenizer:     Tokenizer,
+    args:          &ModelArgs,
+    epochs:        usize,
+    seq_len:       usize,
+    batch_size:    usize,
     learning_rate: f64,
-) -> MambaNlp<TrainBackend> {
+) -> anyhow::Result<MambaNlp<TrainBackend>> {
     let device = WgpuDevice::default();
 
     let model: MambaNlp<TrainBackend> =
         if Path::new(&format!("{SAVE_PATH}.mpk.gz")).exists() {
             match load_model(args, SAVE_PATH, &device) {
-                Ok(m) => { println!("Resumed from checkpoint."); m }
+                Ok(m)  => { println!("Resumed from checkpoint."); m }
                 Err(e) => {
                     println!("Checkpoint load failed ({e}), starting fresh.");
                     MambaNlpConfig::from_args(args).init(&device)
@@ -180,37 +172,31 @@ pub fn train(
         };
 
     run_training_loop(
-        model, texts, tokenizer,
-        epochs, seq_len, batch_size, max_tokens, learning_rate,
+        model, train_dataset, valid_dataset, tokenizer,
+        epochs, seq_len, batch_size, learning_rate,
         &device,
     )
 }
 
-/// Load an existing checkpoint and continue training it (fine-tune / expand).
-///
-/// The model architecture must match `args`.  Use a lower learning rate
-/// (e.g. 1e-5) to avoid destroying previously learned weights.
 pub fn train_from_checkpoint(
     checkpoint_path: &str,
-    texts: &[String],
-    tokenizer: &Tokenizer,
-    args: &ModelArgs,
-    epochs: usize,
-    seq_len: usize,
-    batch_size: usize,
-    max_tokens: Option<usize>,
-    learning_rate: f64,
+    train_dataset:   InMemDataset<TextItem>,
+    valid_dataset:   InMemDataset<TextItem>,
+    tokenizer:       Tokenizer,
+    args:            &ModelArgs,
+    epochs:          usize,
+    seq_len:         usize,
+    batch_size:      usize,
+    learning_rate:   f64,
 ) -> anyhow::Result<MambaNlp<TrainBackend>> {
     let device = WgpuDevice::default();
-
     println!("Loading base model from: {checkpoint_path}");
     let model = load_model(args, checkpoint_path, &device)?;
     println!("Base model loaded. Starting fine-tuning…");
 
-    let trained = run_training_loop(
-        model, texts, tokenizer,
-        epochs, seq_len, batch_size, max_tokens, learning_rate,
+    run_training_loop(
+        model, train_dataset, valid_dataset, tokenizer,
+        epochs, seq_len, batch_size, learning_rate,
         &device,
-    );
-    Ok(trained)
+    )
 }
