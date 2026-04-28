@@ -105,9 +105,8 @@ impl<B: Backend> MambaBlock<B> {
         let b_seq     = x_dbl.clone().slice([0..b, 0..l, dt_rank..dt_rank + d_state]);
         let c_seq     = x_dbl.slice([0..b, 0..l, dt_rank + d_state..x_dbl_dim]);
 
-        // Softplus ensures Δ > 0; clamp for numerical stability.
         let delta: Tensor<B, 3> = softplus(self.dt_proj.forward(delta_raw), 1.0)
-            .clamp(1e-3_f32, 10.0_f32);
+            .clamp(1e-4_f32, 20.0_f32);
 
         self.selective_scan_parallel(input, delta, self.a_log.val(), b_seq, c_seq, self.d_param.val())
     }
@@ -127,7 +126,7 @@ impl<B: Backend> MambaBlock<B> {
 
         let a_neg = a_log.exp().neg().reshape([1, 1, inner_dim, state_dim]);
         let delta4 = delta.reshape([batch, seq_len, inner_dim, 1]);
-        let bar_a: Tensor<B, 4> = (delta4.clone() * a_neg).exp();   // [B, L, D, N]
+        let bar_a: Tensor<B, 4> = (delta4.clone() * a_neg).exp().clamp(1e-6_f32, 1.0_f32);    // [B, L, D, N]
 
         let b4 = b_seq.reshape([batch, seq_len, 1, state_dim]);
         let u4 = u.clone().reshape([batch, seq_len, inner_dim, 1]);
@@ -147,7 +146,7 @@ impl<B: Backend> MambaBlock<B> {
                 let prev = i - step;
                 let a_new = scan_a[i].clone() * scan_a[prev].clone();
                 let b_new = scan_a[i].clone() * scan_b[prev].clone() + scan_b[i].clone();
-                scan_a[i] = a_new;
+                scan_a[i] = a_new.clamp(1e-6_f32, 1.0_f32);
                 scan_b[i] = b_new;
                 i += step * 2;
             }
@@ -161,7 +160,7 @@ impl<B: Backend> MambaBlock<B> {
                 let parent = i - level;
                 let a_new = scan_a[i].clone() * scan_a[parent].clone();
                 let b_new = scan_a[i].clone() * scan_b[parent].clone() + scan_b[i].clone();
-                scan_a[i] = a_new;
+                scan_a[i] = a_new.clamp(1e-6_f32, 1.0_f32);
                 scan_b[i] = b_new;
                 i += level * 2;
             }
@@ -231,9 +230,9 @@ impl<B: Backend> MambaBlock<B> {
         let c_tok     = x_dbl.slice([0..batch, dt_rank + state_dim..dt_rank + 2 * state_dim]);
 
         let delta = softplus(self.dt_proj.forward(delta_raw), 1.0)
-            .clamp(1e-3_f32, 10.0_f32);
+            .clamp(1e-4_f32, 20.0_f32);
 
-        let a_neg = self.a_log.val().exp().neg();
+        let a_neg = self.a_log.val().clamp(-8.0_f32, -0.01_f32).exp().neg();
         let delta3 = delta.clone().unsqueeze_dim::<3>(2);
         let bar_a = (delta3.clone() * a_neg.unsqueeze_dim::<3>(0)).exp();
 

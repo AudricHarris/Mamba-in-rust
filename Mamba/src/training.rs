@@ -136,7 +136,9 @@ pub fn run_training_loop(
         .summary()
         .build(
             model,
-            AdamConfig::new().init(),
+            AdamConfig::new()
+            .with_epsilon(1e-8)
+            .with_grad_clipping(Some(burn::grad_clipping::GradientClippingConfig::Norm(1.0))).init(),
             learning_rate,
         );
 
