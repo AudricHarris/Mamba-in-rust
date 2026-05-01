@@ -5,18 +5,19 @@ mod model;
 mod tokenizer;
 mod training;
 
-use crate::data::{TextItem, split_dataset};
+use crate::data::{AlpacaItem, TextItem, split_dataset};
 use crate::model::{ModelArgs, MambaNlp};
 use crate::tokenizer::Tokenizer;
 use crate::training::{train, train_from_checkpoint, load_model};
 use burn::module::AutodiffModule;
 use burn::backend::wgpu::{Wgpu, WgpuDevice};
 use burn::tensor::{Int, Tensor, TensorData};
-use burn_dataset::{Dataset, InMemDataset, SqliteDataset};
+use burn_dataset::InMemDataset;
 use std::fs;
 use std::io::{self, BufRead, Write};
 use std::path::Path;
 
+// ── CLI helpers ──────────────────────────────────────────────────────────────
 
 fn prompt_line(stdin: &mut impl BufRead, msg: &str) -> String {
     print!("{msg}");
@@ -36,9 +37,7 @@ fn prompt_f64(stdin: &mut impl BufRead, msg: &str) -> Option<f64> {
 
 fn list_checkpoints() -> Vec<String> {
     let dir = Path::new("checkpoints");
-    if !dir.exists() {
-        return vec![];
-    }
+    if !dir.exists() { return vec![]; }
     let mut found: Vec<String> = fs::read_dir(dir)
         .into_iter()
         .flatten()
@@ -74,8 +73,7 @@ fn pick_checkpoint(stdin: &mut impl BufRead, checkpoints: &[String]) -> String {
 }
 
 fn prompt_training_params(
-    stdin: &mut impl BufRead,
-    total_tokens: usize,
+    stdin:      &mut impl BufRead,
     default_lr: f64,
 ) -> (usize, f64) {
     let epochs = prompt_usize(stdin, "Epochs? (Enter = 3): ").unwrap_or(3);
@@ -83,19 +81,18 @@ fn prompt_training_params(
     let lr_prompt = format!("Learning rate? (Enter = {default_lr:.0e}): ");
     let learning_rate = prompt_f64(stdin, &lr_prompt).unwrap_or(default_lr);
     println!("Learning rate: {learning_rate:.2e}");
-    let _ = total_tokens;
     (epochs, learning_rate)
 }
 
 enum StartChoice {
-    Train { epochs: usize, learning_rate: f64 },
+    Train        { epochs: usize, learning_rate: f64 },
     LoadCheckpoint { path: String },
-    FineTune { path: String, epochs: usize, learning_rate: f64 },
+    FineTune     { path: String, epochs: usize, learning_rate: f64 },
 }
 
-fn startup_menu(stdin: &mut impl BufRead, total_tokens: usize) -> StartChoice {
+fn startup_menu(stdin: &mut impl BufRead) -> StartChoice {
     let checkpoints = list_checkpoints();
-    let has_ckpts = !checkpoints.is_empty();
+    let has_ckpts   = !checkpoints.is_empty();
 
     println!();
     println!("┌──────────────────────────────────────┐");
@@ -112,9 +109,9 @@ fn startup_menu(stdin: &mut impl BufRead, total_tokens: usize) -> StartChoice {
     let choice = loop {
         let raw = prompt_line(stdin, "Choice: ");
         match raw.as_str() {
-            "1" => break 1usize,
-            "2" if has_ckpts => break 2,
-            "3" if has_ckpts => break 3,
+            "1"                  => break 1usize,
+            "2" if has_ckpts    => break 2,
+            "3" if has_ckpts    => break 3,
             _ => println!("Please enter a number between 1 and {max_choice}."),
         }
     };
@@ -122,9 +119,8 @@ fn startup_menu(stdin: &mut impl BufRead, total_tokens: usize) -> StartChoice {
     match choice {
         2 => {
             let path = pick_checkpoint(stdin, &checkpoints);
-            println!();
-            println!("Fine-tuning from: {path}.mpk.gz");
-            let (epochs, learning_rate) = prompt_training_params(stdin, total_tokens, 1e-5);
+            println!("\nFine-tuning from: {path}.mpk.gz");
+            let (epochs, learning_rate) = prompt_training_params(stdin, 1e-5);
             StartChoice::FineTune { path, epochs, learning_rate }
         }
         3 => {
@@ -133,74 +129,60 @@ fn startup_menu(stdin: &mut impl BufRead, total_tokens: usize) -> StartChoice {
         }
         _ => {
             println!();
-            let (epochs, learning_rate) = prompt_training_params(stdin, total_tokens, 1e-4);
+            let (epochs, learning_rate) = prompt_training_params(stdin, 1e-4);
             StartChoice::Train { epochs, learning_rate }
         }
     }
 }
 
-// ------------ //
-// Data helpers //
-// ------------ //
+// ── Data helpers ─────────────────────────────────────────────────────────────
 
-fn stream_to_sqlite(url: &str, db_path: &str, limit: Option<usize>) -> anyhow::Result<()> {
-    use std::io::BufReader;
+const ALPACA_URL: &str =
+    "https://huggingface.co/datasets/yahma/alpaca-cleaned/resolve/main/alpaca_data_cleaned.json";
 
-    if Path::new(db_path).exists() {
-        println!("SQLite buffer already exists at {db_path}, skipping download.");
+const ALPACA_CACHE: &str = "data/alpaca_data_cleaned.json";
+
+/// Download the Alpaca JSON file once and cache it locally.
+fn ensure_alpaca_json() -> anyhow::Result<()> {
+    if Path::new(ALPACA_CACHE).exists() {
+        println!("Alpaca cache found at {ALPACA_CACHE}, skipping download.");
         return Ok(());
     }
-    if let Some(parent) = Path::new(db_path).parent() {
+    if let Some(parent) = Path::new(ALPACA_CACHE).parent() {
         std::fs::create_dir_all(parent)?;
     }
-    println!("Streaming dataset from {url} …");
-    let response = ureq::get(url).call()?;
-    let reader = BufReader::new(response.into_reader());
-
-    let conn = rusqlite::Connection::open(db_path)?;
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS data (
-            row_id   INTEGER PRIMARY KEY AUTOINCREMENT,
-            text TEXT NOT NULL
-        );"
-    )?;
-
-    let mut count = 0usize;
-    for line in reader.lines() {
-        let line = line?;
-        if line.trim().is_empty() { continue; }
-        let v: serde_json::Value = serde_json::from_str(&line)?;
-        if let Some(text) = v.get("text").and_then(|t| t.as_str()) {
-            conn.execute("INSERT INTO data (text) VALUES (?1)", [text])?;
-            count += 1;
-        }
-        if let Some(lim) = limit {
-            if count >= lim { break; }
-        }
+    println!("Downloading Alpaca-cleaned dataset …");
+    let response = ureq::get(ALPACA_URL).call()?;
+    let mut reader = response.into_reader();
+    let tmp = format!("{ALPACA_CACHE}.tmp");
+    {
+        let mut file = std::fs::File::create(&tmp)?;
+        std::io::copy(&mut reader, &mut file)?;
     }
-    println!("Inserted {count} rows into {db_path}.");
+    std::fs::rename(&tmp, ALPACA_CACHE)?;
+    println!("Saved to {ALPACA_CACHE}.");
     Ok(())
 }
 
-fn load_buffered_dataset(db_path: &str) -> anyhow::Result<SqliteDataset<TextItem>> {
-    SqliteDataset::<TextItem>::from_db_file(db_path, "data")
-        .map_err(|e| anyhow::anyhow!("Failed to open dataset: {e}"))
+/// Load, parse, and convert Alpaca records to `TextItem`s.
+fn load_alpaca_items(limit: Option<usize>) -> anyhow::Result<Vec<TextItem>> {
+    ensure_alpaca_json()?;
+    let raw = std::fs::read_to_string(ALPACA_CACHE)?;
+    let mut records: Vec<AlpacaItem> = serde_json::from_str(&raw)?;
+    if let Some(lim) = limit {
+        records.truncate(lim);
+    }
+    let items: Vec<TextItem> = records.into_iter().map(TextItem::from).collect();
+    println!("Loaded {} Alpaca records.", items.len());
+    Ok(items)
 }
 
-fn split_to_mem(
-    db_path: &str,
-    valid_frac: f64,
-) -> anyhow::Result<(InMemDataset<TextItem>, InMemDataset<TextItem>)> {
-    let ds = load_buffered_dataset(db_path)?;
-    let (train_items, valid_items) = split_dataset(&ds, valid_frac);
-    Ok((InMemDataset::new(train_items), InMemDataset::new(valid_items)))
-}
-
+// ── Main ─────────────────────────────────────────────────────────────────────
 
 fn main() -> anyhow::Result<()> {
+    // Thread-pool
     let total_cores = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
+        .map(|n| n.get()).unwrap_or(4);
     let use_cores = (total_cores / 2).max(1);
     rayon::ThreadPoolBuilder::new()
         .num_threads(use_cores)
@@ -211,30 +193,23 @@ fn main() -> anyhow::Result<()> {
     let device = WgpuDevice::default();
     println!("Backend: burn-wgpu (GPU). Device: {:?}", device);
 
-    let db_path = "data/buffer.sqlite";
+    // ── Load dataset ──────────────────────────────────────────────────────────
+    // Pass `Some(N)` to cap the number of samples during development,
+    // or `None` to use all ~52 k records.
+    let all_items = load_alpaca_items(None)?;
 
-    stream_to_sqlite(
-        "https://huggingface.co/datasets/ameykaran/english-text-corpus/resolve/main/eng-000.jsonl",
-        db_path,
-        Some(1000),
-    )?;
+    let texts: Vec<String> = all_items.iter().map(|t| t.text.clone()).collect();
 
-    let dataset = load_buffered_dataset(db_path)?;
-    let texts: Vec<String> = (0..dataset.len())
-        .filter_map(|i| dataset.get(i))
-        .map(|item: TextItem| item.text)
-        .collect();
-
-    let tokenizer = Tokenizer::build_from_texts(&texts, 8_000)?;
+    // ── Build tokenizer ───────────────────────────────────────────────────────
+    let tokenizer = Tokenizer::build_from_texts(&texts, 16_000)?;
 
     let total_tokens: usize = texts
         .iter()
         .map(|t| tokenizer.encode(t).len() + 1)
         .sum();
     println!(
-        "Dataset ready: {} samples, {} tokens available.",
-        texts.len(),
-        total_tokens
+        "Dataset ready: {} samples, ~{} tokens.",
+        texts.len(), total_tokens
     );
 
     let args = ModelArgs {
@@ -242,36 +217,31 @@ fn main() -> anyhow::Result<()> {
         ..ModelArgs::default()
     };
 
+    // ── Startup menu ──────────────────────────────────────────────────────────
     let inf_model: MambaNlp<Wgpu> = {
         let stdin_raw = io::stdin();
         let mut stdin = stdin_raw.lock();
-        match startup_menu(&mut stdin, total_tokens) {
+        match startup_menu(&mut stdin) {
             StartChoice::Train { epochs, learning_rate } => {
                 println!("Starting training…");
-                let (train_ds, valid_ds) = split_to_mem(db_path, 0.1)?;
+                let (train_items, valid_items) = split_dataset(all_items, 0.1);
+                let train_ds = InMemDataset::new(train_items);
+                let valid_ds = InMemDataset::new(valid_items);
                 train(
-                    train_ds,
-                    valid_ds,
-                    tokenizer.clone(),
-                    &args,
-                    epochs, 128, 8,
-                    learning_rate,
-                )?
-                .valid()
+                    train_ds, valid_ds, tokenizer.clone(), &args,
+                    epochs, 256, 8, learning_rate,
+                )?.valid()
             }
             StartChoice::FineTune { path, epochs, learning_rate } => {
                 println!("Starting fine-tuning…");
-                let (train_ds, valid_ds) = split_to_mem(db_path, 0.1)?;
+                let (train_items, valid_items) = split_dataset(all_items, 0.1);
+                let train_ds = InMemDataset::new(train_items);
+                let valid_ds = InMemDataset::new(valid_items);
                 train_from_checkpoint(
                     &path,
-                    train_ds,
-                    valid_ds,
-                    tokenizer.clone(),
-                    &args,
-                    epochs, 128, 8,
-                    learning_rate,
-                )?
-                .valid()
+                    train_ds, valid_ds, tokenizer.clone(), &args,
+                    epochs, 128, 8, learning_rate,
+                )?.valid()
             }
             StartChoice::LoadCheckpoint { path } => {
                 println!("Loading checkpoint: {path}…");
@@ -280,6 +250,7 @@ fn main() -> anyhow::Result<()> {
         }
     };
 
+    // ── Inference loop ────────────────────────────────────────────────────────
     let gen_temp: f64        = 0.9;
     let gen_top_p: f64       = 0.9;
     let gen_rep_penalty: f32 = 1.2;
@@ -295,12 +266,14 @@ fn main() -> anyhow::Result<()> {
         let mut prompt = String::new();
         stdin.read_line(&mut prompt)?;
         let trimmed = prompt.trim();
-        if trimmed.is_empty() {
-            break;
-        }
+        if trimmed.is_empty() { break; }
+
+        // Wrap the user prompt in the Alpaca instruction template so generation
+        // is conditioned the same way the model was trained.
+        let formatted = format!("### Instruction:\n{trimmed}\n\n### Response:\n");
 
         let encoded: Vec<i32> = tokenizer
-            .encode(trimmed)
+            .encode(&formatted)
             .into_iter()
             .map(|x| x as i32)
             .collect();
@@ -313,7 +286,7 @@ fn main() -> anyhow::Result<()> {
 
         let output = inf_model.generate(
             input_ids,
-            20,
+            200,            // generate up to 200 new tokens
             gen_temp,
             gen_top_p,
             gen_rep_penalty,
@@ -322,9 +295,7 @@ fn main() -> anyhow::Result<()> {
         let tokens: Vec<i32> = output.into_data().to_vec().unwrap();
         println!(
             "AI: {}\n",
-            tokenizer.decode(
-                &tokens.iter().map(|&x| x as usize).collect::<Vec<_>>()
-            )
+            tokenizer.decode(&tokens.iter().map(|&x| x as usize).collect::<Vec<_>>())
         );
     }
 

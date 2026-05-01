@@ -26,11 +26,11 @@ pub struct ModelArgs {
 impl Default for ModelArgs {
     fn default() -> Self {
         Self {
-            d_model: 128,
-            d_state: 16,
+            d_model: 256,
+            d_state: 32,
             d_inner_factor: 2,
             d_conv: 4,
-            n_layer: 2,
+            n_layer: 6,
             vocab_size: 50257,
             dt_rank: None,
             dropout_rate: 0.01,
