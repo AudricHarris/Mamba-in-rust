@@ -1,7 +1,7 @@
 // ============================================================
 // File: training.rs
 // Developer: Audric HARRIS
-// Update Date: 27/04/2026
+// Update Date: 01/05/2026
 // ============================================================
 
 use burn::{
@@ -11,9 +11,9 @@ use burn::{
     record::{CompactRecorder, Recorder},
     tensor::backend::AutodiffBackend,
     train::{
+        ClassificationOutput,
         LearnerBuilder,
-        metric::LossMetric,
-        RegressionOutput,
+        metric::{AccuracyMetric, LossMetric},
         TrainOutput,
         TrainStep,
         ValidStep,
@@ -34,45 +34,37 @@ pub const SAVE_PATH:    &str = "checkpoints/mamba_model";
 pub const ARTIFACT_DIR: &str = "artifacts";
 
 
-impl<B: AutodiffBackend> TrainStep<MambaBatch<B>, RegressionOutput<B>>
+impl<B: AutodiffBackend> TrainStep<MambaBatch<B>, ClassificationOutput<B>>
     for MambaNlp<B>
 {
-    fn step(&self, batch: MambaBatch<B>) -> TrainOutput<RegressionOutput<B>> {
+    fn step(&self, batch: MambaBatch<B>) -> TrainOutput<ClassificationOutput<B>> {
         let [batch_size, seq_len] = batch.inputs.dims();
         let (logits, loss) = self.forward(batch.inputs, Some(batch.targets.clone()));
         let loss = loss.expect("targets provided → loss must be Some");
 
-        let vocab   = logits.dims()[2];
-        let n       = batch_size * seq_len;
-        let output  = logits.reshape([n, vocab]);
-        let targets = batch.targets
-            .reshape([n])
-            .float()
-            .unsqueeze_dim::<2>(1);
+        let vocab = logits.dims()[2];
+        let output  = logits.reshape([batch_size * seq_len, vocab]);
+        let targets = batch.targets.reshape([batch_size * seq_len]);
 
-        let regression_out = RegressionOutput::new(loss.clone(), output, targets);
-        TrainOutput::new(self, loss.backward(), regression_out)
+        let classification_out = ClassificationOutput::new(loss.clone(), output, targets);
+        TrainOutput::new(self, loss.backward(), classification_out)
     }
 }
 
 impl<B: burn::tensor::backend::Backend>
-    ValidStep<MambaBatch<B>, RegressionOutput<B>>
+    ValidStep<MambaBatch<B>, ClassificationOutput<B>>
     for MambaNlp<B>
 {
-    fn step(&self, batch: MambaBatch<B>) -> RegressionOutput<B> {
+    fn step(&self, batch: MambaBatch<B>) -> ClassificationOutput<B> {
         let [batch_size, seq_len] = batch.inputs.dims();
         let (logits, loss) = self.forward(batch.inputs, Some(batch.targets.clone()));
         let loss = loss.expect("targets provided → loss must be Some");
 
         let vocab   = logits.dims()[2];
-        let n       = batch_size * seq_len;
-        let output  = logits.reshape([n, vocab]);
-        let targets = batch.targets
-            .reshape([n])
-            .float()
-            .unsqueeze_dim::<2>(1);
+        let output  = logits.reshape([batch_size * seq_len, vocab]);
+        let targets = batch.targets.reshape([batch_size * seq_len]);
 
-        RegressionOutput::new(loss, output, targets)
+        ClassificationOutput::new(loss, output, targets)
     }
 }
 
@@ -124,12 +116,14 @@ pub fn run_training_loop(
 
     let dataloader_valid = DataLoaderBuilder::new(batcher_valid)
         .batch_size(batch_size)
-        .num_workers(2)
+        .num_workers(1)
         .build(valid_dataset);
 
     let learner = LearnerBuilder::new(ARTIFACT_DIR)
         .metric_train_numeric(LossMetric::new())
         .metric_valid_numeric(LossMetric::new())
+        .metric_train_numeric(AccuracyMetric::new())
+        .metric_valid_numeric(AccuracyMetric::new())
         .with_file_checkpointer(CompactRecorder::new())
         .devices(vec![device.clone()])
         .num_epochs(epochs)
@@ -137,8 +131,11 @@ pub fn run_training_loop(
         .build(
             model,
             AdamConfig::new()
-            .with_epsilon(1e-8)
-            .with_grad_clipping(Some(burn::grad_clipping::GradientClippingConfig::Norm(1.0))).init(),
+                .with_epsilon(1e-8)
+                .with_grad_clipping(Some(
+                    burn::grad_clipping::GradientClippingConfig::Norm(1.0)
+                ))
+                .init(),
             learning_rate,
         );
 

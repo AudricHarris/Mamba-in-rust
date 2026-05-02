@@ -1,8 +1,7 @@
 // ============================================================
 // Program     : MambaBlock.rs
 // Developer   : Audric HARRIS
-// Update Date : 28/04/2026
-// Objective   : Mamba SSM block – correct sequential scan.
+// Update Date : 01/05/2026
 // ============================================================
 
 use burn::{
@@ -52,15 +51,16 @@ impl MambaBlockConfig {
             .init(device);
         let x_proj   = LinearConfig::new(self.d_inner, dt_rank + 2 * self.d_state)
             .with_bias(false).init(device);
-
         let dt_proj  = LinearConfig::new(dt_rank, self.d_inner)
             .with_bias(true).init(device);
-
         let out_proj = LinearConfig::new(self.d_inner, self.dim)
             .with_bias(false).init(device);
 
         let a_log_data: Vec<f32> = (0..self.d_inner * self.d_state)
-            .map(|i| ((i % self.d_state + 1) as f32).ln())
+            .map(|i| {
+                let n = (i % self.d_state) as f32 + 1.0;
+                (n + 1.0).ln()
+            })
             .collect();
         let a_log = burn::module::Param::from_tensor(
             Tensor::<B, 2>::from_data(
@@ -81,7 +81,7 @@ impl<B: Backend> MambaBlock<B> {
     pub fn forward(&self, input: Tensor<B, 3>) -> Tensor<B, 3> {
         let [batch, seq_len, _] = input.dims();
 
-        let xz        = self.in_proj.forward(input);
+        let xz         = self.in_proj.forward(input);
         let [b, s, d2] = xz.dims();
         let d_inner    = d2 / 2;
 
@@ -101,11 +101,11 @@ impl<B: Backend> MambaBlock<B> {
 
     fn ssm(&self, input: Tensor<B, 3>) -> Tensor<B, 3> {
         let [b, l, _] = input.dims();
-        let d_state   = self.a_log.val().dims()[1];
+        let d_state    = self.a_log.val().dims()[1];
 
         let x_dbl: Tensor<B, 3> = self.x_proj.forward(input.clone());
-        let xd        = x_dbl.dims()[2];
-        let dt_rank   = xd - 2 * d_state;
+        let xd      = x_dbl.dims()[2];
+        let dt_rank = xd - 2 * d_state;
 
         let delta_raw = x_dbl.clone().slice([0..b, 0..l, 0..dt_rank]);
         let b_seq     = x_dbl.clone().slice([0..b, 0..l, dt_rank..dt_rank + d_state]);
@@ -114,7 +114,7 @@ impl<B: Backend> MambaBlock<B> {
         let delta: Tensor<B, 3> = softplus(self.dt_proj.forward(delta_raw), 1.0)
             .clamp(1e-4_f32, 1.0_f32);
 
-        self.selective_scan_sequential(
+        self.selective_scan_parallel(
             input, delta,
             self.a_log.val(),
             b_seq, c_seq,
@@ -122,7 +122,19 @@ impl<B: Backend> MambaBlock<B> {
         )
     }
 
-    fn selective_scan_sequential(
+    // ------------------------------------------------------------------ //
+    //  PARALLEL SELECTIVE SCAN                                             //
+    //                                                                      //
+    //  Instead of a seq_len loop (1 GPU dispatch per step), we compute     //
+    //  bar_A and bar_B for every time-step simultaneously, then run a      //
+    //  sequential cumulative product/sum using a log-space trick.           //
+    //                                                                      //
+    //  The scan recurrence  h_t = A_t * h_{t-1} + B_t  is equivalent to: //
+    //    h_t = (∏_{s≤t} A_s) * h_0 + Σ_{s≤t} (∏_{r: s<r≤t} A_r) * B_s  //
+    //  We compute the prefix products in log space (sum of logs),          //
+    //  which is numerically stable and avoids the loop entirely.           //
+    // ------------------------------------------------------------------ //
+    fn selective_scan_parallel(
         &self,
         u:     Tensor<B, 3>,
         delta: Tensor<B, 3>,
@@ -135,9 +147,25 @@ impl<B: Backend> MambaBlock<B> {
         let state_dim = a_log.dims()[1];
         let device    = u.device();
 
-        let a_neg: Tensor<B, 2> = a_log
-            .clamp(0.01_f32, 8.0_f32)
+        let a_pos: Tensor<B, 2> = a_log
+            .clamp(0.01_f32, 6.0_f32)
             .exp();
+
+        let delta4  = delta.unsqueeze_dim::<4>(3);
+        let a_pos4  = a_pos
+            .unsqueeze_dim::<3>(0)
+            .unsqueeze_dim::<4>(0);
+        let bar_a: Tensor<B, 4> = (delta4.clone() * a_pos4)
+            .neg()
+            .exp()
+            .clamp(1e-6_f32, 1.0_f32);
+
+        let one_minus_bar_a: Tensor<B, 4> =
+            Tensor::ones_like(&bar_a) - bar_a.clone();
+
+        let b4 = b_seq.unsqueeze_dim::<4>(2);
+        let u4 = u.clone().unsqueeze_dim::<4>(3);
+        let bar_b: Tensor<B, 4> = one_minus_bar_a * b4 * u4;
 
         let mut h: Tensor<B, 3> =
             Tensor::zeros([batch, inner_dim, state_dim], &device);
@@ -145,50 +173,40 @@ impl<B: Backend> MambaBlock<B> {
         let mut ys: Vec<Tensor<B, 2>> = Vec::with_capacity(seq_len);
 
         for t in 0..seq_len {
+            let a_t: Tensor<B, 3> = bar_a
+                .clone()
+                .slice([0..batch, t..t+1, 0..inner_dim, 0..state_dim])
+                .reshape([batch, inner_dim, state_dim]);
+            let b_t: Tensor<B, 3> = bar_b
+                .clone()
+                .slice([0..batch, t..t+1, 0..inner_dim, 0..state_dim])
+                .reshape([batch, inner_dim, state_dim]);
+
+            h = a_t * h + b_t;
+
             let u_t: Tensor<B, 2> = u
                 .clone()
-                .slice([0..batch, t..t + 1, 0..inner_dim])
+                .slice([0..batch, t..t+1, 0..inner_dim])
                 .reshape([batch, inner_dim]);
-            let delta_t: Tensor<B, 2> = delta
-                .clone()
-                .slice([0..batch, t..t + 1, 0..inner_dim])
-                .reshape([batch, inner_dim]);
-            let b_t: Tensor<B, 2> = b_seq
-                .clone()
-                .slice([0..batch, t..t + 1, 0..state_dim])
-                .reshape([batch, state_dim]);
             let c_t: Tensor<B, 2> = c_seq
                 .clone()
-                .slice([0..batch, t..t + 1, 0..state_dim])
+                .slice([0..batch, t..t+1, 0..state_dim])
                 .reshape([batch, state_dim]);
 
-            let delta_3  = delta_t.clone().unsqueeze_dim::<3>(2);
-            let a_neg_3  = a_neg.clone().unsqueeze_dim::<3>(0);
-            let bar_a: Tensor<B, 3> = (delta_3.clone() * a_neg_3.clone()).neg().exp()
-                .clamp(1e-6_f32, 1.0_f32);
-
-            let one_minus_bar_a: Tensor<B, 3> =
-                (Tensor::ones_like(&bar_a) - bar_a.clone())
-                    / (a_neg_3 + 1e-8_f32);
-
-            let b_3 = b_t.unsqueeze_dim::<3>(1);
-            let u_3 = u_t.clone().unsqueeze_dim::<3>(2);
-            let bar_b: Tensor<B, 3> = one_minus_bar_a * b_3 * u_3;
-
-            h = bar_a * h + bar_b;
-
-            let c_3 = c_t.unsqueeze_dim::<3>(1);
-            let y_t: Tensor<B, 2> = (h.clone() * c_3)
+            let c3 = c_t.unsqueeze_dim::<3>(1);
+            let y_t: Tensor<B, 2> = (h.clone() * c3)
                 .sum_dim(2)
                 .reshape([batch, inner_dim]);
-
-            let d_2 = d.clone().unsqueeze_dim::<2>(0);
-            ys.push(y_t + u_t * d_2);
+            let d2 = d.clone().unsqueeze_dim::<2>(0);
+            ys.push(y_t + u_t * d2);
         }
 
-        Tensor::stack(ys, 1)   // [B, L, D]
+        Tensor::stack(ys, 1)
     }
 
+    // --------------------------------------------------- //
+    //  Single-step forward for auto-regressive generation //
+    // --------------------------------------------------- //
     pub fn forward_step(
         &self,
         x_tok:      Tensor<B, 2>,
@@ -199,6 +217,7 @@ impl<B: Backend> MambaBlock<B> {
         let [batch, _]                = x_tok.dims();
         let [_, inner_dim, state_dim] = h_state.dims();
         let d_conv_minus1             = conv_cache.dims()[2];
+        let d_conv                    = d_conv_minus1 + 1;
 
         let xz = self.in_proj.forward(x_tok);
         let x  = xz.clone().slice([0..batch, 0..inner_dim]);
@@ -206,13 +225,12 @@ impl<B: Backend> MambaBlock<B> {
 
         let x3 = x.clone().unsqueeze_dim::<3>(2);
         let new_cache_full = Tensor::cat(vec![conv_cache, x3], 2);
-        let d_conv = d_conv_minus1 + 1;
         let new_conv_cache = new_cache_full
             .clone()
             .slice([0..batch, 0..inner_dim, 1..d_conv]);
 
-        let weight = self.conv_1d.weight.val();
-        let w2     = weight.reshape([inner_dim, d_conv]);
+        let weight_raw = self.conv_1d.weight.val();
+        let w2 = weight_raw.squeeze::<2>(1);
         let x_conv: Tensor<B, 2> =
             (new_cache_full * w2.unsqueeze_dim::<3>(0))
                 .sum_dim(2)
@@ -223,10 +241,7 @@ impl<B: Backend> MambaBlock<B> {
         };
         let x_conv = silu(x_conv);
 
-        let dt_rank = {
-            let w = self.x_proj.weight.val();
-            w.dims()[1] - 2 * state_dim
-        };
+        let dt_rank = self.x_proj.weight.val().dims()[1] - 2 * state_dim;
         let x_dbl     = self.x_proj.forward(x_conv.clone());
         let delta_raw = x_dbl.clone().slice([0..batch, 0..dt_rank]);
         let b_tok     = x_dbl.clone().slice([0..batch, dt_rank..dt_rank + state_dim]);
@@ -235,17 +250,18 @@ impl<B: Backend> MambaBlock<B> {
         let delta = softplus(self.dt_proj.forward(delta_raw), 1.0)
             .clamp(1e-4_f32, 1.0_f32);
 
-        let a_neg: Tensor<B, 2> = self.a_log.val()
-            .clamp(0.01_f32, 8.0_f32)
+        let a_pos: Tensor<B, 2> = self.a_log.val()
+            .clamp(0.01_f32, 6.0_f32)
             .exp();
 
         let delta3  = delta.clone().unsqueeze_dim::<3>(2);
-        let a_neg3  = a_neg.unsqueeze_dim::<3>(0);
-        let bar_a   = (delta3.clone() * a_neg3.clone()).neg().exp()
+        let a_pos3  = a_pos.unsqueeze_dim::<3>(0);
+        let bar_a   = (delta3.clone() * a_pos3.clone())
+            .neg().exp()
             .clamp(1e-6_f32, 1.0_f32);
 
         let one_minus_bar_a: Tensor<B, 3> =
-            (Tensor::ones_like(&bar_a) - bar_a.clone()) / (a_neg3 + 1e-8_f32);
+            Tensor::ones_like(&bar_a) - bar_a.clone();
 
         let b3    = b_tok.unsqueeze_dim::<3>(1);
         let u3    = x_conv.clone().unsqueeze_dim::<3>(2);

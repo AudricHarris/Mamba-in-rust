@@ -5,7 +5,7 @@ mod model;
 mod tokenizer;
 mod training;
 
-use crate::data::{AlpacaItem, TextItem, split_dataset};
+use crate::data::{AlpacaItem, TextItem, split_dataset, load_jsonl_items};
 use crate::model::{ModelArgs, MambaNlp};
 use crate::tokenizer::Tokenizer;
 use crate::training::{train, train_from_checkpoint, load_model};
@@ -17,7 +17,6 @@ use std::fs;
 use std::io::{self, BufRead, Write};
 use std::path::Path;
 
-// ── CLI helpers ──────────────────────────────────────────────────────────────
 
 fn prompt_line(stdin: &mut impl BufRead, msg: &str) -> String {
     print!("{msg}");
@@ -37,7 +36,9 @@ fn prompt_f64(stdin: &mut impl BufRead, msg: &str) -> Option<f64> {
 
 fn list_checkpoints() -> Vec<String> {
     let dir = Path::new("checkpoints");
-    if !dir.exists() { return vec![]; }
+    if !dir.exists() {
+        return vec![];
+    }
     let mut found: Vec<String> = fs::read_dir(dir)
         .into_iter()
         .flatten()
@@ -73,7 +74,7 @@ fn pick_checkpoint(stdin: &mut impl BufRead, checkpoints: &[String]) -> String {
 }
 
 fn prompt_training_params(
-    stdin:      &mut impl BufRead,
+    stdin: &mut impl BufRead,
     default_lr: f64,
 ) -> (usize, f64) {
     let epochs = prompt_usize(stdin, "Epochs? (Enter = 3): ").unwrap_or(3);
@@ -84,65 +85,130 @@ fn prompt_training_params(
     (epochs, learning_rate)
 }
 
+
 enum StartChoice {
-    Train        { epochs: usize, learning_rate: f64 },
+    Pretrain {
+        pretrain_epochs: usize,
+        pretrain_lr: f64,
+        finetune: bool,
+        finetune_epochs: usize,
+        finetune_lr: f64,
+    },
+    TrainAlpaca { epochs: usize, learning_rate: f64 },
+    FineTune { path: String, epochs: usize, learning_rate: f64 },
     LoadCheckpoint { path: String },
-    FineTune     { path: String, epochs: usize, learning_rate: f64 },
 }
 
 fn startup_menu(stdin: &mut impl BufRead) -> StartChoice {
     let checkpoints = list_checkpoints();
-    let has_ckpts   = !checkpoints.is_empty();
+    let has_ckpts = !checkpoints.is_empty();
 
     println!();
-    println!("┌──────────────────────────────────────┐");
-    println!("│           Mamba LM — Menu            │");
-    println!("├──────────────────────────────────────┤");
-    println!("│  1) Train from scratch / resume      │");
+    println!("┌──────────────────────────────────────────────────┐");
+    println!("│              Mamba LM — Menu                     │");
+    println!("├──────────────────────────────────────────────────┤");
+    println!("│  1) Pretrain on English corpus (+optional Alpaca)│");
+    println!("│  2) Fine-tune on Alpaca (scratch / auto-resume)  │");
     if has_ckpts {
-        println!("│  2) Train from existing checkpoint   │");
-        println!("│  3) Load checkpoint (inference only) │");
+        println!("│  3) Fine-tune from existing checkpoint           │");
+        println!("│  4) Load checkpoint (inference only)             │");
     }
-    println!("└──────────────────────────────────────┘");
+    println!("└──────────────────────────────────────────────────┘");
 
-    let max_choice = if has_ckpts { 3 } else { 1 };
+    let max_choice = if has_ckpts { 4 } else { 2 };
     let choice = loop {
         let raw = prompt_line(stdin, "Choice: ");
         match raw.as_str() {
-            "1"                  => break 1usize,
-            "2" if has_ckpts    => break 2,
-            "3" if has_ckpts    => break 3,
+            "1" => break 1usize,
+            "2" => break 2,
+            "3" if has_ckpts => break 3,
+            "4" if has_ckpts => break 4,
             _ => println!("Please enter a number between 1 and {max_choice}."),
         }
     };
 
     match choice {
-        2 => {
+        1 => {
+            println!("\n── Pretraining on English corpus ──");
+            let (pretrain_epochs, pretrain_lr) = prompt_training_params(stdin, 1e-4);
+            let do_ft = matches!(
+                prompt_line(stdin, "Also fine-tune on Alpaca afterwards? [y/N]: ")
+                    .to_lowercase()
+                    .as_str(),
+                "y" | "yes"
+            );
+            let (finetune_epochs, finetune_lr) = if do_ft {
+                println!("\n── Alpaca fine-tuning params ──");
+                prompt_training_params(stdin, 1e-5)
+            } else {
+                (0, 0.0)
+            };
+            StartChoice::Pretrain {
+                pretrain_epochs,
+                pretrain_lr,
+                finetune: do_ft,
+                finetune_epochs,
+                finetune_lr,
+            }
+        }
+        3 if has_ckpts => {
             let path = pick_checkpoint(stdin, &checkpoints);
             println!("\nFine-tuning from: {path}.mpk.gz");
             let (epochs, learning_rate) = prompt_training_params(stdin, 1e-5);
             StartChoice::FineTune { path, epochs, learning_rate }
         }
-        3 => {
+        4 if has_ckpts => {
             let path = pick_checkpoint(stdin, &checkpoints);
             StartChoice::LoadCheckpoint { path }
         }
         _ => {
             println!();
             let (epochs, learning_rate) = prompt_training_params(stdin, 1e-4);
-            StartChoice::Train { epochs, learning_rate }
+            StartChoice::TrainAlpaca { epochs, learning_rate }
         }
     }
 }
 
-// ── Data helpers ─────────────────────────────────────────────────────────────
+
+const CORPUS_URL: &str =
+    "https://huggingface.co/datasets/ameykaran/english-text-corpus/resolve/main/eng-000.jsonl";
+
+const CORPUS_CACHE: &str = "data/eng-000.jsonl";
+
+fn ensure_corpus_jsonl() -> anyhow::Result<()> {
+    if Path::new(CORPUS_CACHE).exists() {
+        println!("Corpus cache found at {CORPUS_CACHE}, skipping download.");
+        return Ok(());
+    }
+    if let Some(parent) = Path::new(CORPUS_CACHE).parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    println!("Downloading English text corpus …");
+    let response = ureq::get(CORPUS_URL).call()?;
+    let mut reader = response.into_reader();
+    let tmp = format!("{CORPUS_CACHE}.tmp");
+    {
+        let mut file = std::fs::File::create(&tmp)?;
+        std::io::copy(&mut reader, &mut file)?;
+    }
+    std::fs::rename(&tmp, CORPUS_CACHE)?;
+    println!("Saved to {CORPUS_CACHE}.");
+    Ok(())
+}
+
+fn load_corpus_items(limit: Option<usize>) -> anyhow::Result<Vec<TextItem>> {
+    ensure_corpus_jsonl()?;
+    let items = load_jsonl_items(CORPUS_CACHE, limit)?;
+    println!("Loaded {} corpus records.", items.len());
+    Ok(items)
+}
+
 
 const ALPACA_URL: &str =
     "https://huggingface.co/datasets/yahma/alpaca-cleaned/resolve/main/alpaca_data_cleaned.json";
 
 const ALPACA_CACHE: &str = "data/alpaca_data_cleaned.json";
 
-/// Download the Alpaca JSON file once and cache it locally.
 fn ensure_alpaca_json() -> anyhow::Result<()> {
     if Path::new(ALPACA_CACHE).exists() {
         println!("Alpaca cache found at {ALPACA_CACHE}, skipping download.");
@@ -164,7 +230,6 @@ fn ensure_alpaca_json() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Load, parse, and convert Alpaca records to `TextItem`s.
 fn load_alpaca_items(limit: Option<usize>) -> anyhow::Result<Vec<TextItem>> {
     ensure_alpaca_json()?;
     let raw = std::fs::read_to_string(ALPACA_CACHE)?;
@@ -177,12 +242,34 @@ fn load_alpaca_items(limit: Option<usize>) -> anyhow::Result<Vec<TextItem>> {
     Ok(items)
 }
 
-// ── Main ─────────────────────────────────────────────────────────────────────
+const TOKENIZER_PATH: &str = "checkpoints/tokenizer.json";
+
+fn build_or_load_tokenizer(
+    texts_for_training: &[String],
+    vocab_size: usize,
+) -> anyhow::Result<Tokenizer> {
+    if Path::new(TOKENIZER_PATH).exists() {
+        println!("Loading existing tokenizer from {TOKENIZER_PATH} …");
+        let tok = Tokenizer::load(TOKENIZER_PATH)?;
+        println!("Tokenizer loaded (vocab={})", tok.vocab_size);
+        return Ok(tok);
+    }
+    println!("Building BPE tokenizer from {} texts …", texts_for_training.len());
+    let tok = Tokenizer::build_from_texts(texts_for_training, vocab_size)?;
+    if let Some(parent) = Path::new(TOKENIZER_PATH).parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    tok.save(TOKENIZER_PATH)?;
+    println!("Tokenizer saved to {TOKENIZER_PATH} (vocab={})", tok.vocab_size);
+    Ok(tok)
+}
+
+const PRETRAIN_CHECKPOINT: &str = "checkpoints/mamba_pretrained";
 
 fn main() -> anyhow::Result<()> {
-    // Thread-pool
     let total_cores = std::thread::available_parallelism()
-        .map(|n| n.get()).unwrap_or(4);
+        .map(|n| n.get())
+        .unwrap_or(4);
     let use_cores = (total_cores / 2).max(1);
     rayon::ThreadPoolBuilder::new()
         .num_threads(use_cores)
@@ -193,66 +280,162 @@ fn main() -> anyhow::Result<()> {
     let device = WgpuDevice::default();
     println!("Backend: burn-wgpu (GPU). Device: {:?}", device);
 
-    // ── Load dataset ──────────────────────────────────────────────────────────
-    // Pass `Some(N)` to cap the number of samples during development,
-    // or `None` to use all ~52 k records.
-    let all_items = load_alpaca_items(None)?;
-
-    let texts: Vec<String> = all_items.iter().map(|t| t.text.clone()).collect();
-
-    // ── Build tokenizer ───────────────────────────────────────────────────────
-    let tokenizer = Tokenizer::build_from_texts(&texts, 16_000)?;
-
-    let total_tokens: usize = texts
-        .iter()
-        .map(|t| tokenizer.encode(t).len() + 1)
-        .sum();
-    println!(
-        "Dataset ready: {} samples, ~{} tokens.",
-        texts.len(), total_tokens
-    );
-
-    let args = ModelArgs {
-        vocab_size: tokenizer.vocab_size,
-        ..ModelArgs::default()
-    };
-
-    // ── Startup menu ──────────────────────────────────────────────────────────
     let inf_model: MambaNlp<Wgpu> = {
         let stdin_raw = io::stdin();
         let mut stdin = stdin_raw.lock();
+
         match startup_menu(&mut stdin) {
-            StartChoice::Train { epochs, learning_rate } => {
-                println!("Starting training…");
-                let (train_items, valid_items) = split_dataset(all_items, 0.1);
-                let train_ds = InMemDataset::new(train_items);
-                let valid_ds = InMemDataset::new(valid_items);
+
+            StartChoice::Pretrain {
+                pretrain_epochs,
+                pretrain_lr,
+                finetune,
+                finetune_epochs,
+                finetune_lr,
+            } => {
+                let corpus_items = load_corpus_items(Some(10_000))?;
+
+                let alpaca_items_for_tok = if finetune {
+                    println!("Pre-loading Alpaca texts for tokenizer vocabulary …");
+                    load_alpaca_items(None)?
+                } else {
+                    vec![]
+                };
+
+                let all_texts_for_tok: Vec<String> = corpus_items
+                    .iter()
+                    .chain(alpaca_items_for_tok.iter())
+                    .map(|t| t.text.clone())
+                    .collect();
+                let tokenizer = build_or_load_tokenizer(&all_texts_for_tok, 16_000)?;
+
+                let args = ModelArgs {
+                    vocab_size: tokenizer.vocab_size,
+                    ..ModelArgs::default()
+                };
+
+                println!("\n═══════════════════════════════════════");
+                println!(" PHASE 1 — Pretraining on English corpus");
+                println!("═══════════════════════════════════════");
+                let (corpus_train, corpus_valid) = split_dataset(corpus_items, 0.05);
+                println!(
+                    "Corpus split: {} train / {} valid",
+                    corpus_train.len(), corpus_valid.len()
+                );
+                let pretrained = train(
+                    InMemDataset::new(corpus_train),
+                    InMemDataset::new(corpus_valid),
+                    tokenizer.clone(),
+                    &args,
+                    pretrain_epochs,
+                    128,
+                    16,
+                    pretrain_lr,
+                )?;
+
+                crate::training::save_model(&pretrained, PRETRAIN_CHECKPOINT)?;
+                println!("Pretrain checkpoint saved to {PRETRAIN_CHECKPOINT}");
+
+                if !finetune {
+                    pretrained.valid()
+                } else {
+                    println!("\n═══════════════════════════════════════");
+                    println!(" PHASE 2 — Fine-tuning on Alpaca");
+                    println!("═══════════════════════════════════════");
+                    let alpaca_items = if alpaca_items_for_tok.is_empty() {
+                        load_alpaca_items(None)?
+                    } else {
+                        alpaca_items_for_tok
+                    };
+                    let (alpaca_train, alpaca_valid) = split_dataset(alpaca_items, 0.1);
+                    println!(
+                        "Alpaca split: {} train / {} valid",
+                        alpaca_train.len(), alpaca_valid.len()
+                    );
+                    train_from_checkpoint(
+                        PRETRAIN_CHECKPOINT,
+                        InMemDataset::new(alpaca_train),
+                        InMemDataset::new(alpaca_valid),
+                        tokenizer.clone(),
+                        &args,
+                        finetune_epochs,
+                        128,
+                        16,
+                        finetune_lr,
+                    )?.valid()
+                }
+            }
+
+            StartChoice::TrainAlpaca { epochs, learning_rate } => {
+                let alpaca_items = load_alpaca_items(None)?;
+                let all_texts: Vec<String> =
+                    alpaca_items.iter().map(|t| t.text.clone()).collect();
+                let tokenizer = build_or_load_tokenizer(&all_texts, 16_000)?;
+                let args = ModelArgs {
+                    vocab_size: tokenizer.vocab_size,
+                    ..ModelArgs::default()
+                };
+                println!("Starting Alpaca training…");
+                let (train_items, valid_items) = split_dataset(alpaca_items, 0.1);
                 train(
-                    train_ds, valid_ds, tokenizer.clone(), &args,
-                    epochs, 256, 8, learning_rate,
+                    InMemDataset::new(train_items),
+                    InMemDataset::new(valid_items),
+                    tokenizer.clone(),
+                    &args,
+                    epochs,
+                    128,
+                    16,
+                    learning_rate,
                 )?.valid()
             }
+
             StartChoice::FineTune { path, epochs, learning_rate } => {
-                println!("Starting fine-tuning…");
-                let (train_items, valid_items) = split_dataset(all_items, 0.1);
-                let train_ds = InMemDataset::new(train_items);
-                let valid_ds = InMemDataset::new(valid_items);
+                let alpaca_items = load_alpaca_items(None)?;
+                let all_texts: Vec<String> =
+                    alpaca_items.iter().map(|t| t.text.clone()).collect();
+                let tokenizer = build_or_load_tokenizer(&all_texts, 16_000)?;
+                let args = ModelArgs {
+                    vocab_size: tokenizer.vocab_size,
+                    ..ModelArgs::default()
+                };
+                println!("Starting fine-tuning from {path}…");
+                let (train_items, valid_items) = split_dataset(alpaca_items, 0.1);
                 train_from_checkpoint(
                     &path,
-                    train_ds, valid_ds, tokenizer.clone(), &args,
-                    epochs, 128, 8, learning_rate,
+                    InMemDataset::new(train_items),
+                    InMemDataset::new(valid_items),
+                    tokenizer.clone(),
+                    &args,
+                    epochs,
+                    256,
+                    8,
+                    learning_rate,
                 )?.valid()
             }
+
             StartChoice::LoadCheckpoint { path } => {
+                let tokenizer = Tokenizer::load(TOKENIZER_PATH).map_err(|e| {
+                    anyhow::anyhow!(
+                        "Cannot load tokenizer from {TOKENIZER_PATH}: {e}\n\
+                         Run training at least once to build it."
+                    )
+                })?;
+                let args = ModelArgs {
+                    vocab_size: tokenizer.vocab_size,
+                    ..ModelArgs::default()
+                };
                 println!("Loading checkpoint: {path}…");
                 load_model(&args, &path, &device)?.valid()
             }
         }
     };
 
-    // ── Inference loop ────────────────────────────────────────────────────────
-    let gen_temp: f64        = 0.9;
-    let gen_top_p: f64       = 0.9;
+    let tokenizer = Tokenizer::load(TOKENIZER_PATH).unwrap_or_else(|_| {
+        panic!("Tokenizer not found at {TOKENIZER_PATH}. Train the model first.");
+    });
+
+    let gen_temp: f64 = 0.9;
+    let gen_top_p: f64 = 0.9;
     let gen_rep_penalty: f32 = 1.2;
 
     println!("\nReady. Type a prompt (empty line to quit).");
@@ -266,10 +449,10 @@ fn main() -> anyhow::Result<()> {
         let mut prompt = String::new();
         stdin.read_line(&mut prompt)?;
         let trimmed = prompt.trim();
-        if trimmed.is_empty() { break; }
+        if trimmed.is_empty() {
+            break;
+        }
 
-        // Wrap the user prompt in the Alpaca instruction template so generation
-        // is conditioned the same way the model was trained.
         let formatted = format!("### Instruction:\n{trimmed}\n\n### Response:\n");
 
         let encoded: Vec<i32> = tokenizer
@@ -286,7 +469,7 @@ fn main() -> anyhow::Result<()> {
 
         let output = inf_model.generate(
             input_ids,
-            200,            // generate up to 200 new tokens
+            200,
             gen_temp,
             gen_top_p,
             gen_rep_penalty,
